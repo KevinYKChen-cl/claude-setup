@@ -1,7 +1,9 @@
 # Install my Claude Code setup on this Windows machine. Safe to run again: finished parts are skipped.
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #   powershell -ExecutionPolicy Bypass -File install.ps1 -TestRoot C:\temp\try   # install into a test folder instead
-param([string]$TestRoot)
+#   -AllowUnmerged         install from a branch or uncommitted changes (testing a change on this machine)
+#   -OverwriteLocalEdits   replace installed copies that were edited in place (they are backed up first)
+param([string]$TestRoot, [switch]$AllowUnmerged, [switch]$OverwriteLocalEdits)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with the progress bar on
@@ -18,6 +20,8 @@ $BdVersion = '1.3.4'
 $BdSha256 = 'e66e7b66c0d1ac6a878951462edddb4a177532aff3fc22989daac115feaaef11'   # beads_1.3.4_windows_amd64.zip
 $ScottyTag = 'v0.4.0'
 $ScottyCommit = 'cf6dda198db15a77399d1d9e77292618a7d08fa1'
+$ArchifyVersion = '3.3.2'
+$ArchifySha256 = '932d915f83fdbf44796cc6b20b085455a763491306e1b8dee92047e11dddc0ea'   # archify.zip of release v3.3.2
 
 $Repo = $PSScriptRoot
 if ($TestRoot) {
@@ -53,6 +57,24 @@ function Copy-Folder($from, $to) {
     Copy-Item $from $to -Recurse
 }
 
+function Git-Out {
+    # A git command's output in this repo, or $null when it fails.
+    $ErrorActionPreference = 'Continue'   # Windows PowerShell turns a native command's stderr into an error under Stop
+    $out = & git -C $Repo @args 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    ($out -join "`n").Trim()
+}
+
+function Test-Committed($file, $repoPath) {
+    # True when the file's content was committed to this repo at some point (the same bytes git would store for
+    # $repoPath). An installed copy always is; a copy edited in place is not.
+    $blob = Git-Out hash-object "--path=$repoPath" $file
+    if (-not $blob) { return $false }
+    $ErrorActionPreference = 'Continue'
+    & git -C $Repo cat-file -e $blob 2>$null
+    $LASTEXITCODE -eq 0
+}
+
 Step 'Checking tools'
 $missing = @()
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { $missing += 'Git (winget install Git.Git)' }
@@ -72,25 +94,128 @@ if (-not (Get-Command claude -ErrorAction SilentlyContinue)) {
 }
 New-Item -ItemType Directory -Force -Path $SkillsDir, $BinDir | Out-Null
 
-Step 'Global rules: ~/.claude/CLAUDE.md'
-$claudeMd = Join-Path $ClaudeDir 'CLAUDE.md'
-$source = Join-Path $Repo 'CLAUDE.md'
-if ((Test-Path $claudeMd) -and ((Get-FileHash $claudeMd).Hash -eq (Get-FileHash $source).Hash)) {
-    Write-Host 'already up to date'
-} else {
-    if (Test-Path $claudeMd) {
-        $backup = "$claudeMd.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
-        Copy-Item $claudeMd $backup
-        Write-Host "old file backed up to $backup"
+Step 'This repo: only what is merged into main'
+$branch = Git-Out rev-parse --abbrev-ref HEAD
+$repoHead = Git-Out rev-parse HEAD
+if (-not $repoHead) { throw "$Repo is not a git clone. Clone the repo (see README) and run install.ps1 from the clone." }
+$dirty = Git-Out status --porcelain
+$null = Git-Out fetch -q origin main
+$originMain = Git-Out rev-parse origin/main
+$problems = @()
+if ($branch -ne 'main') { $problems += "on branch '$branch', not main" }
+if ($dirty) { $problems += 'uncommitted changes:'; $problems += ($dirty -split "`n" | ForEach-Object { "    $_" }) }
+if ($originMain -and $repoHead -ne $originMain -and $branch -eq 'main') { $problems += 'main is not the same as origin/main (git pull, or push first)' }
+if ($problems) {
+    if (-not $AllowUnmerged) {
+        Write-Host 'Stopped: this installs only main as merged on GitHub, and this checkout is' -ForegroundColor Yellow
+        $problems | ForEach-Object { Write-Host "  $_" }
+        Write-Host 'Switch to main and git pull. To try a branch on this machine, run again with -AllowUnmerged.'
+        exit 1
     }
-    Copy-Item $source $claudeMd -Force
-    $Done += 'CLAUDE.md'
-    Write-Host 'installed'
+    Write-Host 'Installing anyway (-AllowUnmerged):' -ForegroundColor Yellow
+    $problems | ForEach-Object { Write-Host "  $_" }
+}
+Write-Host "commit $($repoHead.Substring(0, 7)) on $branch"
+
+# What claude-setup installed last time on this machine: where the repo was and at which commit.
+$recordFile = Join-Path $ClaudeDir 'claude-setup.json'
+$record = $null
+if (Test-Path $recordFile) { $record = Get-Content $recordFile -Raw | ConvertFrom-Json }
+if ($record -and $record.commit -and $record.commit -ne $repoHead) {
+    $stat = Git-Out diff --stat $record.commit $repoHead -- CLAUDE.md skills install.ps1
+    if ($stat) {
+        Write-Host "Changed since the last install ($($record.commit.Substring(0, 7))):"
+        $stat -split "`n" | ForEach-Object { Write-Host "  $_" }
+    } elseif ($null -eq $stat) {
+        Write-Host "The last install was from commit $($record.commit.Substring(0, 7)), which this clone does not have."
+    }
 }
 
-Step 'Skill: ticket-flow'
-Copy-Folder (Join-Path $Repo 'skills\ticket-flow') (Join-Path $SkillsDir 'ticket-flow')
-Write-Host 'installed'
+# The files this repo installs: the global rules and every folder in skills/.
+$managed = @([pscustomobject]@{ Name = 'CLAUDE.md'; Source = (Join-Path $Repo 'CLAUDE.md'); Target = (Join-Path $ClaudeDir 'CLAUDE.md') })
+foreach ($dir in Get-ChildItem (Join-Path $Repo 'skills') -Directory) {
+    $managed += [pscustomobject]@{ Name = "skills/$($dir.Name)"; Source = $dir.FullName; Target = (Join-Path $SkillsDir $dir.Name) }
+}
+
+Step 'Installed copies edited in place'
+# A copy in ~/.claude whose content was never committed here was edited there. Installing would replace it, so
+# stop and say which, unless told to overwrite. Edits belong in this repo (AGENTS.md says how).
+$edited = @()
+foreach ($m in $managed) {
+    if (-not (Test-Path $m.Target)) { continue }
+    if ((Get-Item $m.Target).PSIsContainer) {
+        foreach ($f in Get-ChildItem $m.Target -Recurse -File) {
+            $rel = $f.FullName.Substring($m.Target.Length + 1) -replace '\\', '/'
+            if (-not (Test-Committed $f.FullName "$($m.Name)/$rel")) { $edited += "$($m.Name)/$rel" }
+        }
+    } elseif (-not (Test-Committed $m.Target $m.Name)) {
+        $edited += $m.Name
+    }
+}
+if ($edited) {
+    if (-not $OverwriteLocalEdits) {
+        Write-Host 'Stopped: these installed files in ~/.claude differ from anything committed to this repo:' -ForegroundColor Yellow
+        $edited | ForEach-Object { Write-Host "  $_" }
+        Write-Host 'To keep an edit, make it in this repo (branch and PR, see AGENTS.md), then install again.'
+        Write-Host 'To discard them, run again with -OverwriteLocalEdits; they are backed up first.'
+        exit 1
+    }
+    $backupDir = Join-Path $ClaudeDir "backups\claude-setup-$(Get-Date -Format yyyyMMdd-HHmmss)"
+    New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+    foreach ($m in $managed) {
+        if (Test-Path $m.Target) { Copy-Item $m.Target (Join-Path $backupDir ($m.Name -replace '/', '_')) -Recurse }
+    }
+    Write-Host "overwriting; the old copies are backed up in $backupDir" -ForegroundColor Yellow
+} else {
+    Write-Host 'none'
+}
+
+Step 'Global rules and skills from this repo'
+foreach ($m in $managed) {
+    if ((Get-Item $m.Source).PSIsContainer) {
+        Copy-Folder $m.Source $m.Target
+    } else {
+        Copy-Item $m.Source $m.Target -Force
+    }
+    Write-Host "installed $($m.Name)"
+}
+$Done += ($managed | ForEach-Object { $_.Name }) -join ', '
+
+Step "archify $ArchifyVersion (used by code-tour)"
+$archifyDir = Join-Path $SkillsDir 'archify'
+$archifySkill = Join-Path $archifyDir 'SKILL.md'
+$archifyMarker = Join-Path $SkillsDir 'ARCHIFY_VERSION.txt'
+$manualOnly = 'disable-model-invocation: true'
+if ((Test-Path $archifySkill) -and (Test-Path $archifyMarker) -and
+    (Select-String -Path $archifyMarker -SimpleMatch "archify $ArchifyVersion," -Quiet) -and
+    (Select-String -Path $archifySkill -SimpleMatch $manualOnly -Quiet)) {
+    Write-Host 'already installed'
+} else {
+    $tmp = New-TempDir
+    try {
+        $zip = Join-Path $tmp 'archify.zip'
+        Invoke-WebRequest -UseBasicParsing -OutFile $zip `
+            "https://github.com/tt-a1i/archify/releases/download/v$ArchifyVersion/archify.zip"
+        $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+        if ($hash -ne $ArchifySha256) { throw "archify download checksum mismatch: $hash" }
+        Expand-Archive $zip (Join-Path $tmp 'out')
+        Copy-Folder (Join-Path $tmp 'out\archify') $archifyDir
+    } finally {
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    # Manual only: archify's long description stays out of every session's context and it never starts
+    # on its own. code-tour reads its files and runs its CLI directly; /archify still works when typed.
+    $text = [IO.File]::ReadAllText($archifySkill)
+    if (-not $text.Contains($manualOnly)) {
+        $text = ([regex]'(?m)^name: archify\r?$').Replace($text, "name: archify`n$manualOnly", 1)
+        if (-not $text.Contains($manualOnly)) { throw "could not mark $archifySkill as manual only" }
+        [IO.File]::WriteAllText($archifySkill, $text, (New-Object Text.UTF8Encoding $false))
+    }
+    Native node (Join-Path $archifyDir 'bin\archify.mjs') doctor
+    Set-Content -Path $archifyMarker -Value "archify $ArchifyVersion, installed $(Get-Date -Format yyyy-MM-dd)" -Encoding ASCII
+    $Done += "archify $ArchifyVersion"
+    Write-Host 'installed, checksum OK, manual only'
+}
 
 Step "Pocock skills ($($PocockCommit.Substring(0, 7)))"
 $pocockMarker = Join-Path $SkillsDir 'POCOCK_VERSION.txt'
@@ -140,14 +265,28 @@ $env:NEXT_TELEMETRY_DISABLED = '1'
 if ((Test-Path $scottyMarker) -and ((Get-Content $scottyMarker) -eq $ScottyCommit)) {
     Write-Host 'already installed'
 } else {
+    # A running board holds files in this folder: deleting it would stop halfway and leave Scotty broken.
+    $running = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like "*$ScottyDir*" }
+    if ($running) {
+        throw "Scotty is running (PID $(($running | ForEach-Object { $_.ProcessId }) -join ', ')). Close the board, then run this script again."
+    }
     if (Test-Path $ScottyDir) { Remove-Item $ScottyDir -Recurse -Force }
     Native git clone -q --depth 1 --branch $ScottyTag https://github.com/brendan-appstart/bead-me-up-scotty.git $ScottyDir
-    $head = (git -C $ScottyDir rev-parse HEAD).Trim()
-    if ($head -ne $ScottyCommit) { throw "Scotty $ScottyTag is $head, expected $ScottyCommit" }
+    $scottyHead = (git -C $ScottyDir rev-parse HEAD).Trim()
+    if ($scottyHead -ne $ScottyCommit) { throw "Scotty $ScottyTag is $scottyHead, expected $ScottyCommit" }
     Push-Location $ScottyDir
     try {
         Native npm ci --no-audit --no-fund
-        Native npm run build
+        # Next.js refuses the first build of a version it lists as having a known security vulnerability, and
+        # allows the same build again right after that reminder. Scotty $ScottyTag pins one (Next.js 16.4.1)
+        # and has no newer release yet, so build again once and say so. Upgrade Scotty when it ships a fix.
+        $log = Join-Path $ScottyDir 'claude-setup-build.log'
+        cmd /c "npm run build > `"$log`" 2>&1"
+        if ($LASTEXITCODE -ne 0 -and (Select-String -Path $log -SimpleMatch 'known security vulnerability' -Quiet)) {
+            Write-Host "Warning: Next.js reports a known security vulnerability in the version Scotty $ScottyTag uses. Building again as Next.js allows; upgrade Scotty when a fixed release is out." -ForegroundColor Yellow
+            cmd /c "npm run build > `"$log`" 2>&1"
+        }
+        if ($LASTEXITCODE -ne 0) { Get-Content $log -Tail 30; throw "Scotty build failed ($LASTEXITCODE); log: $log" }
     } finally {
         Pop-Location
     }
@@ -179,7 +318,22 @@ if ($TestRoot) {
     }
 }
 
+Step 'Record'
+# Where this repo is on this machine and what it installed: the global rules tell agents to edit the repo,
+# not the copies, and find it here.
+$remote = Git-Out remote get-url origin
+$recordJson = [ordered]@{
+    repo        = $Repo
+    remote      = $remote
+    branch      = $branch
+    commit      = $repoHead
+    installedAt = (Get-Date -Format s)
+    installs    = @($managed | ForEach-Object { $_.Name })
+} | ConvertTo-Json
+[IO.File]::WriteAllText($recordFile, $recordJson, (New-Object Text.UTF8Encoding $false))
+Write-Host "wrote $recordFile"
+
 Step 'Done'
 if ($Done) { Write-Host "Installed or updated: $($Done -join ', ')" } else { Write-Host 'Everything was already up to date.' }
 if ($pathChanged) { Write-Host 'Open a new terminal so bd and scotty are found.' }
-Write-Host 'Start a new Claude Code session to pick up the rules and skills. In a repo, type /ticket-flow.'
+Write-Host 'Start a new Claude Code session to pick up the rules and skills. In a repo, type /ticket-flow; to explain a repo or a change, type /code-tour.'

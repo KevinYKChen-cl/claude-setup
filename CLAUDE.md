@@ -7,3 +7,6 @@
 ## 開發流程的固定要求
 - grill 時，需求問完後也要確認模組怎麼切、介面長怎樣，寫成 ADR。
 - 拆票時，如果有幾張票要同時做、又會改到同樣的檔案，第一張票先做地基：新專案是建好模組和介面；既有專案是先 prefactor，把這次要改的地方整理出清楚的模組或介面。其他票盡量只動自己的檔案。功能小、現有結構夠用、或打算依序做時，不用加地基票。
+
+## 個人設定
+- `~/.claude/CLAUDE.md` 和 claude-setup 裝進 `~/.claude/skills/` 的 skill 都是副本，不要直接改。要改就到 claude-setup repo 改：位置寫在 `~/.claude/claude-setup.json` 的 `repo`，流程照那個 repo 的 `AGENTS.md`（開分支、commit、開 PR，merge 留給使用者）。
