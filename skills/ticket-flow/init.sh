@@ -8,15 +8,26 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 
-personal=(CLAUDE.local.md .beads/ .claude/ docs/agents/ docs/adr/ GLOSSARY.md CONTEXT.md)
+wanted=(CLAUDE.local.md .beads/ .claude/ docs/agents/ docs/adr/ GLOSSARY.md CONTEXT.md)
+# The files this script writes: if the team tracks one of them, writing it would change a team file.
+written=(CLAUDE.local.md .beads/ docs/agents/)
 
-# Exclude only works for untracked files: stop if the team already tracks one of them.
-tracked="$(git ls-files -- "${personal[@]}" | head -5)"
-if [ -n "$tracked" ]; then
-  echo "Stopped: these personal paths are already tracked by the repo:"
-  echo "$tracked"
+# Exclude only works for untracked files. A path the team already tracks is the team's: leave it
+# alone and say so. Stop only if the team tracks a file this script would write.
+clash="$(git ls-files -- "${written[@]}" | head -5)"
+if [ -n "$clash" ]; then
+  echo "Stopped: the repo tracks files this setup would write:"
+  echo "$clash"
   exit 1
 fi
+personal=()
+for p in "${wanted[@]}"; do
+  if [ -n "$(git ls-files -- "$p" | head -1)" ]; then
+    echo "skipped: $p is tracked by the repo (the team's); personal files under it would show in git status"
+  else
+    personal+=("$p")
+  fi
+done
 
 if [ -d .beads ]; then
   echo "beads: already set up, skipped"

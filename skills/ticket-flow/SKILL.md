@@ -21,7 +21,7 @@ If either is missing, tell me in two or three short lines what setup does, then 
 - adds the personal files to `.git/info/exclude`: `CLAUDE.local.md`, `.beads/`, `.claude/`, `docs/agents/`, `docs/adr/`, `GLOSSARY.md`, `CONTEXT.md`
 - writes `CLAUDE.local.md` and `docs/agents/` from the templates, so `/setup-matt-pocock-skills` isn't needed
 
-After I agree, run `bash ~/.claude/skills/ticket-flow/init.sh` and show its result. If it stops because a personal path is already tracked by the repo, tell me which one and stop. The next step is then `/grill-with-docs <what I want to build>`.
+After I agree, run `bash ~/.claude/skills/ticket-flow/init.sh` and show its result. A personal path the repo already tracks (for example a team `.claude/`) is the team's: the script skips it and says so, and you tell me that personal files under it will show in `git status`. The script stops only if the repo tracks a file it would write (`CLAUDE.local.md`, `.beads/`, `docs/agents/`); then tell me which one and stop. The next step is then `/grill-with-docs <what I want to build>`.
 
 ## 2. Where am I?
 
